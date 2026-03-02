@@ -84,6 +84,12 @@ typedef enum {
     E_RTT_CB_TARGET_LOST,
 } E_RTT_CB;
 
+typedef enum {
+    E_RTT_IO_NO_CB,
+    E_RTT_IO_NO_TRAFFIC,
+    E_RTT_IO_TRAFFIC
+} E_RTT_IO;
+
 #define TARGET_RAM_START        (g_board_info.target_cfg->ram_regions[0].start)
 #define TARGET_RAM_END          (g_board_info.target_cfg->ram_regions[0].end)
 
@@ -112,8 +118,10 @@ static StreamBufferHandle_t     stream_rtt_console_to_target;                  /
 static EventGroupHandle_t       events;
 
 static TimerHandle_t            timer_rtt_io;                                  // timeout for RTT IO (esp needed for RTT while DAP)
-static const TickType_t         timeout_rtt_io_while_dap_tt = pdMS_TO_TICKS(8);
-static const TickType_t         timeout_rtt_io_endless_tt   = portMAX_DELAY;
+static const TickType_t         timeout_rtt_io_while_dap_tt    = pdMS_TO_TICKS(8);
+static const TickType_t         timeout_rtt_io_endless_tt      = portMAX_DELAY;
+static const TickType_t         timeout_rtt_io_short_search_tt = pdMS_TO_TICKS(4);
+static const TickType_t         timeout_rtt_io_long_search_tt  = pdMS_TO_TICKS(1000);
 
 #if INCLUDE_SYSVIEW
     #define RTT_CHANNEL_SYSVIEW 1
@@ -487,7 +495,7 @@ static bool rtt_to_target(EXT_SEGGER_RTT_BUFFER_DOWN *extRttBuf, StreamBufferHan
 
 
 
-static void do_rtt_io(uint32_t rtt_cb, const TickType_t timeout_tt)
+static E_RTT_IO do_rtt_io(uint32_t rtt_cb, const TickType_t timeout_tt)
 /**
  * Do RTT IO until either the RTT_CB is lost OR if there is another SWD request OR a timeout happened.
  */
@@ -507,20 +515,19 @@ static void do_rtt_io(uint32_t rtt_cb, const TickType_t timeout_tt)
     bool net_sysview_was_connected = false;
     bool working_sysview = false;
 #endif
-    bool ok;
-    bool probe_rtt_cb;
+    bool ok = true;
+    bool probe_rtt_cb = true;
+    bool hadTraffic = false;
 
     static_assert(sizeof(uint32_t) == sizeof(unsigned int), "uint32_t/unsigned int mix up");    // why doesn't segger use uint32_t?
 
     if (rtt_cb < TARGET_RAM_START  ||  rtt_cb > TARGET_RAM_END - sizeof(EXT_SEGGER_RTT_CB_HEADER)) {
-        return;
+        return E_RTT_IO_NO_CB;
     }
 
     // do operations
     xTimerChangePeriod(timer_rtt_io, timeout_tt, 100);
     rtt_console_running = true;
-    probe_rtt_cb = true;
-    ok = true;
     while (ok  &&  !sw_unlock_requested()  &&  xTimerIsTimerActive(timer_rtt_io)) {
         if (ok  &&  probe_rtt_cb) {
             //
@@ -576,6 +583,7 @@ static void do_rtt_io(uint32_t rtt_cb, const TickType_t timeout_tt)
                 if (valid_console_to_target)
                     ok = ok  &&  rtt_to_target(&aDownConsole, stream_rtt_console_to_target, &working_uart);
 
+                hadTraffic = hadTraffic || working_uart;
                 probe_rtt_cb = probe_rtt_cb  &&  !working_uart;
 
 #if INCLUDE_SYSVIEW
@@ -603,6 +611,7 @@ static void do_rtt_io(uint32_t rtt_cb, const TickType_t timeout_tt)
             if (ok_sysview_to_target)
                 ok = ok  &&  rtt_to_target(&aDownSysView, stream_rtt_sysview_to_target, &working_sysview);
 
+            hadTraffic = hadTraffic || working_sysview;
             probe_rtt_cb = probe_rtt_cb  &&  !working_sysview;
         }
         else {
@@ -613,6 +622,14 @@ static void do_rtt_io(uint32_t rtt_cb, const TickType_t timeout_tt)
 //    printf("ee %d %d %d\n", ok, sw_unlock_requested(), xTimerIsTimerActive(timer_rtt_io));
     rtt_console_running = false;
     xTimerStop(timer_rtt_io, 100);
+
+    if ( !ok) {
+        return E_RTT_IO_NO_CB;
+    }
+    if (hadTraffic) {
+        return E_RTT_IO_TRAFFIC;
+    }
+    return E_RTT_IO_NO_TRAFFIC;
 }   // do_rtt_io
 
 
@@ -721,6 +738,8 @@ static void rtt_while_debugging(void)
 
 static void rtt_state_machine(void)
 /**
+ * Handle all the states of \n state_rtt_cb_detection.
+ *
  * \pre
  *    possessing E_SWLOCK_RTT
  */
@@ -730,11 +749,11 @@ static void rtt_state_machine(void)
     }
 
     if (state_rtt_cb_detection == E_RTT_CB_WAIT_TARGET) {
-        led_state(LS_NO_TARGET);
-
         //
         // try to detect target
         //
+        led_state(LS_NO_TARGET);
+
         if (g_board_info.prerun_board_config != NULL) {
             g_board_info.prerun_board_config();
         }
@@ -752,6 +771,9 @@ static void rtt_state_machine(void)
     }
 
     if (state_rtt_cb_detection == E_RTT_CB_SEARCH) {
+        //
+        // search for RTT_CB
+        //
         led_state(LS_TARGET_FOUND);
 
         if ( !target_connect()) {
@@ -783,33 +805,61 @@ static void rtt_state_machine(void)
     }
 
     if (state_rtt_cb_detection == E_RTT_CB_FOUND) {
+        //
+        // try to find out if the found RTT_CB is active
+        //
         led_state(LS_RTT_CB_FOUND);
 
         if ( !target_connect()) {
             state_rtt_cb_detection = E_RTT_CB_TARGET_LOST;
         }
         else {
-            do_rtt_io(rtt_cb, timeout_rtt_io_endless_tt);
+            E_RTT_IO r;
 
+            do_rtt_io(rtt_cb, timeout_rtt_io_short_search_tt);        // short timeout just to clean up
+            r = do_rtt_io(rtt_cb, timeout_rtt_io_long_search_tt);     // and now check if there is traffic on this RTT_CB
+            if (r == E_RTT_IO_NO_CB) {
+                rtt_cb = 0;
+//                printf("E_RTT_IO_NO_CB\n");
+                state_rtt_cb_detection = E_RTT_CB_SEARCH;
+            }
+            else if (r == E_RTT_IO_TRAFFIC) {
+//                printf("E_RTT_IO_TRAFFIC\n");
+                state_rtt_cb_detection = E_RTT_CB_ACTIVE;
+            }
+            else {
+//                printf("E_RTT_IO_NO_TRAFFIC\n");
+                rtt_cb += segger_alignment;
+                state_rtt_cb_detection = E_RTT_CB_SEARCH;
+            }
             target_disconnect();
         }
     }
 
     if (state_rtt_cb_detection == E_RTT_CB_ACTIVE) {
+        //
+        // the RTT_CB is active, do RTT until something bad happens
+        //
         led_state(LS_RTT_CB_FOUND);
 
         if ( !target_connect()) {
             state_rtt_cb_detection = E_RTT_CB_TARGET_LOST;
         }
         else {
-            do_rtt_io(rtt_cb, timeout_rtt_io_endless_tt);
+            E_RTT_IO r;
 
+            r = do_rtt_io(rtt_cb, timeout_rtt_io_endless_tt);
+            if (r == E_RTT_IO_NO_CB) {
+                rtt_cb = 0;
+                state_rtt_cb_detection = E_RTT_CB_SEARCH;
+            }
             target_disconnect();
         }
     }
 
     if (state_rtt_cb_detection == E_RTT_CB_TARGET_LOST) {
         picoprobe_info("=================================== Target lost\n");
+        rtt_cb = 0;
         state_rtt_cb_detection = E_RTT_CB_INIT;
     }
 }   // rtt_state_machine
@@ -819,14 +869,17 @@ static void rtt_state_machine(void)
 void rtt_io_thread(void *ptr)
 {
     for (;;) {
-        printf("!!!!!!!!!!!!!!!!!!!!!! x %d %d 0x%08x\n", state_rtt_cb_detection, rtt_cb_ok, (unsigned)rtt_cb);
+//        printf("!!!!!!!!!!!!!!!!!!!!!! x %d %d 0x%08x\n", state_rtt_cb_detection, rtt_cb_ok, (unsigned)rtt_cb);
         sw_lock(E_SWLOCK_RTT);
-        printf("!!!!!!!!!!!!!!!!!!!!!! y %d %d 0x%08x\n", state_rtt_cb_detection, rtt_cb_ok, (unsigned)rtt_cb);
+//        printf("!!!!!!!!!!!!!!!!!!!!!! y %d %d 0x%08x\n", state_rtt_cb_detection, rtt_cb_ok, (unsigned)rtt_cb);
         // post: we have the interface
 
         if ( !dap_is_connected()) {
             if (state_rtt_cb_detection == E_RTT_CB_FOUND  ||  state_rtt_cb_detection == E_RTT_CB_TARGET_LOST) {
                 state_rtt_cb_detection = E_RTT_CB_SEARCH;
+            }
+            else if (state_rtt_cb_detection == E_RTT_CB_ACTIVE) {
+                state_rtt_cb_detection = E_RTT_CB_FOUND;
             }
             rtt_state_machine();
             sw_unlock(E_SWLOCK_RTT);
