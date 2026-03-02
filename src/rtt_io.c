@@ -101,8 +101,8 @@ static const uint32_t           segger_alignment = 4;
 static const uint8_t            seggerRTT[16] = "SEGGER RTT\0\0\0\0\0\0";
 static EXT_SEGGER_RTT_CB_HEADER rtt_cb_header = {0};
 static bool                     rtt_console_running = false;
-static bool                     ok_console_from_target = false;
-static bool                     ok_console_to_target = false;
+static bool                     valid_console_from_target = false;
+static bool                     valid_console_to_target = false;
 
 static E_RTT_CB                 state_rtt_cb_detection = E_RTT_CB_INIT;
 
@@ -181,6 +181,7 @@ static bool is_target_ok(uint32_t addr)
 static bool search_for_rtt_cb(uint32_t *p_rtt_cb, const TickType_t timeout_tt)
 /**
  * Search for the RTT control block.
+ * Search ends after RAM is scanned until the end address OR if there is an unlock request OR a timeout happened
  *
  * \param p_rtt_cb  where the search begins or zero for new scan, on exit it holds the last
  *                  RAM block scanned for RTT_CB
@@ -203,6 +204,9 @@ static bool search_for_rtt_cb(uint32_t *p_rtt_cb, const TickType_t timeout_tt)
     else if (rtt_check_control_block_header(rtt_cb)) {
         // -> valid control block!
         return true;
+    }
+    else {
+        // continue search
     }
 
     // note that searches must somehow overlap to find (unaligned) control blocks at the border of read chunks
@@ -485,14 +489,14 @@ static bool rtt_to_target(EXT_SEGGER_RTT_BUFFER_DOWN *extRttBuf, StreamBufferHan
 
 static void do_rtt_io(uint32_t rtt_cb, const TickType_t timeout_tt)
 /**
- * Do RTT IO until either the RTT_CB is lost or if there is another SWD request.
+ * Do RTT IO until either the RTT_CB is lost OR if there is another SWD request OR a timeout happened.
  */
 {
 #if OPT_TARGET_UART
     EXT_SEGGER_RTT_BUFFER_UP   aUpConsole;       // Up buffer, transferring information up from target via debug probe to host
     EXT_SEGGER_RTT_BUFFER_DOWN aDownConsole;     // Down buffer, transferring information from host via debug probe to target
-    ok_console_from_target = false;
-    ok_console_to_target = false;
+    valid_console_from_target = false;
+    valid_console_to_target = false;
     bool working_uart = false;
 #endif
 #if INCLUDE_SYSVIEW
@@ -521,16 +525,17 @@ static void do_rtt_io(uint32_t rtt_cb, const TickType_t timeout_tt)
         if (ok  &&  probe_rtt_cb) {
             //
             // check RTT control block and also all RTT channels
+            // This is checked on beginning of loop and if there is a pause in RTT communication
             //
-//            printf("%8x %d %d %d %d %d\n", (unsigned int)rtt_cb, ok, probe_rtt_cb, working_uart, ok_console_from_target, ok_console_to_target);
+//            printf("%8x %d %d %d %d %d\n", (unsigned int)rtt_cb, ok, probe_rtt_cb, working_uart, valid_console_from_target, valid_console_to_target);
             // did nothing -> check if RTT channels (dis)appeared
             ok = ok  &&  rtt_check_control_block_header(rtt_cb);
 //            printf("xx %d\n", ok);
 #if OPT_TARGET_UART
-            if ( !ok_console_from_target)
-                ok = ok  &&  rtt_check_channel_from_target(rtt_cb, RTT_CHANNEL_CONSOLE, &aUpConsole, &ok_console_from_target);
-            if ( !ok_console_to_target)
-                ok = ok  &&  rtt_check_channel_to_target(rtt_cb, RTT_CHANNEL_CONSOLE, &aDownConsole, &ok_console_to_target);
+            if ( !valid_console_from_target)
+                ok = ok  &&  rtt_check_channel_from_target(rtt_cb, RTT_CHANNEL_CONSOLE, &aUpConsole, &valid_console_from_target);
+            if ( !valid_console_to_target)
+                ok = ok  &&  rtt_check_channel_to_target(rtt_cb, RTT_CHANNEL_CONSOLE, &aDownConsole, &valid_console_to_target);
 #endif
 #if INCLUDE_SYSVIEW
             if ( !ok_sysview_from_target)
@@ -545,7 +550,7 @@ static void do_rtt_io(uint32_t rtt_cb, const TickType_t timeout_tt)
             }
         }
 
-        probe_rtt_cb = true;
+        probe_rtt_cb = true;         // will be cleared if there was some traffic via RTT
 
         //
         // RTT console IO
@@ -565,10 +570,10 @@ static void do_rtt_io(uint32_t rtt_cb, const TickType_t timeout_tt)
             {
                 working_uart = false;
 
-                if (ok_console_from_target)
+                if (valid_console_from_target)
                     ok = ok  &&  rtt_from_target(&aUpConsole, cdc_uart_write, false, &working_uart);
 
-                if (ok_console_to_target)
+                if (valid_console_to_target)
                     ok = ok  &&  rtt_to_target(&aDownConsole, stream_rtt_console_to_target, &working_uart);
 
                 probe_rtt_cb = probe_rtt_cb  &&  !working_uart;
@@ -769,8 +774,8 @@ static void rtt_state_machine(void)
                 if (rtt_cb != prev_rtt_cb) {
                     rtt_cb_ok = true;
                     picoprobe_info("---- RTT_CB found at 0x%x\n", (unsigned)rtt_cb);
-                    state_rtt_cb_detection = E_RTT_CB_FOUND;
                 }
+                state_rtt_cb_detection = E_RTT_CB_FOUND;
             }
 
             target_disconnect();
@@ -820,6 +825,9 @@ void rtt_io_thread(void *ptr)
         // post: we have the interface
 
         if ( !dap_is_connected()) {
+            if (state_rtt_cb_detection == E_RTT_CB_FOUND  ||  state_rtt_cb_detection == E_RTT_CB_TARGET_LOST) {
+                state_rtt_cb_detection = E_RTT_CB_SEARCH;
+            }
             rtt_state_machine();
             sw_unlock(E_SWLOCK_RTT);
             vTaskDelay(pdMS_TO_TICKS(100));            // give the other tasks the opportunity to catch sw_lock();
@@ -976,7 +984,7 @@ bool rtt_console_cb_exists(void)
  * @return true if console RTT channel is active
  */
 {
-    return rtt_console_running  &&  ok_console_to_target;
+    return rtt_console_running  &&  valid_console_to_target;
 }   // rtt_console_cb_exists
 
 
@@ -1041,7 +1049,7 @@ void rtt_console_init(uint32_t task_prio)
     }
 #endif
 
-    timer_rtt_io = xTimerCreate("RTT IO timeout", pdMS_TO_TICKS(8),   pdFALSE, NULL, rtt_cb_timeout_null);
+    timer_rtt_io = xTimerCreate("RTT IO timeout", timeout_rtt_io_endless_tt,   pdFALSE, NULL, rtt_cb_timeout_null);
 
 #if NEW_RTT
     xTaskCreate(rtt_io_thread, "RTT-IO", configMINIMAL_STACK_SIZE, NULL, task_prio, &task_rtt_console);
