@@ -740,6 +740,8 @@ static void rtt_state_machine(void)
  *
  * \pre
  *    possessing E_SWLOCK_RTT
+ *
+ * TODO would be great to detect situation when there is only one RTT_CB in RAM
  */
 {
     if (state_rtt_cb_detection == E_RTT_CB_INIT) {
