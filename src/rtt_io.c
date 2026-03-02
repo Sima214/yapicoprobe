@@ -696,8 +696,6 @@ static void rtt_print_target_info(void)
 
 
 
-#define NEW_RTT   1
-
 #if !OPT_RTT_WHILE_DEBUGGING
     #define dap_is_connected()     false
 #endif
@@ -867,34 +865,6 @@ static void rtt_state_machine(void)
 
 
 void rtt_io_thread(void *ptr)
-{
-    for (;;) {
-//        printf("!!!!!!!!!!!!!!!!!!!!!! x %d %d 0x%08x\n", state_rtt_cb_detection, rtt_cb_ok, (unsigned)rtt_cb);
-        sw_lock(E_SWLOCK_RTT);
-//        printf("!!!!!!!!!!!!!!!!!!!!!! y %d %d 0x%08x\n", state_rtt_cb_detection, rtt_cb_ok, (unsigned)rtt_cb);
-        // post: we have the interface
-
-        if ( !dap_is_connected()) {
-            if (state_rtt_cb_detection == E_RTT_CB_FOUND  ||  state_rtt_cb_detection == E_RTT_CB_TARGET_LOST) {
-                state_rtt_cb_detection = E_RTT_CB_SEARCH;
-            }
-            else if (state_rtt_cb_detection == E_RTT_CB_ACTIVE) {
-                state_rtt_cb_detection = E_RTT_CB_FOUND;
-            }
-            rtt_state_machine();
-            sw_unlock(E_SWLOCK_RTT);
-            vTaskDelay(pdMS_TO_TICKS(100));            // give the other tasks the opportunity to catch sw_lock();
-        }
-        else {
-            rtt_while_debugging();
-            sw_unlock(E_SWLOCK_RTT);
-        }
-    }
-}   // rtt_io_thread
-
-
-
-void rtt_io_thread_old(void *ptr)
 /**
  * Do RTT input/output for console and SystemView.
  *
@@ -921,110 +891,27 @@ void rtt_io_thread_old(void *ptr)
  * --> no RTT while DAP
  */
 {
-    uint32_t rtt_cb = 0;
-    bool rtt_cb_ok = false;
-    bool target_online = false;
-
     for (;;) {
-        if ( !target_online) {
-            if (g_board_info.prerun_board_config != NULL) {
-                g_board_info.prerun_board_config();
-            }
-            if (g_board_info.target_cfg->rt_board_id != NULL) {
-                rtt_print_target_info();
-            }
-        }
-
-        printf("!!!!!!!!!!!!!!!!!!!!!! 1\n");
+//        printf("!!!!!!!!!!!!!!!!!!!!!! x %d %d 0x%08x\n", state_rtt_cb_detection, rtt_cb_ok, (unsigned)rtt_cb);
         sw_lock(E_SWLOCK_RTT);
+//        printf("!!!!!!!!!!!!!!!!!!!!!! y %d %d 0x%08x\n", state_rtt_cb_detection, rtt_cb_ok, (unsigned)rtt_cb);
         // post: we have the interface
-        printf("!!!!!!!!!!!!!!!!!!!!!! 2\n");
 
-
-#if OPT_RTT_WHILE_DEBUGGING  // EXPERIMENTAL FEATURE
-        if (dap_is_connected()) {
-            //
-            // Do RTT while debugging until a DAP command arrives
-            // Note that dap_is_connected() must be caught here, because the code downwards disturbs debugging
-            //
-            do {
-                uint32_t prev_rtt_cb;
-
-                prev_rtt_cb = rtt_cb;
-                if ( !search_for_rtt_cb( &rtt_cb, timeout_rtt_io_while_dap_tt)) {
-                    if (rtt_cb_ok) {
-                        rtt_cb_ok = false;
-                        picoprobe_info("---- no RTT_CB found (RTT during DAP)\n");
-                    }
-                    break;
-                }
-
-                if (rtt_cb != prev_rtt_cb) {
-                    rtt_cb_ok = true;
-                    picoprobe_info("---- RTT_CB found at 0x%x (RTT during DAP)\n", (unsigned)rtt_cb);
-                }
-
-                do_rtt_io(rtt_cb, timeout_rtt_io_while_dap_tt);
-            } while ( !sw_unlock_requested()  &&  is_target_ok(0));
-            sw_unlock(E_SWLOCK_RTT);
-            continue;
-        }
-#else
-        if (dap_is_connected()) {
-            picoprobe_error("RTT WHILE DEBUGGING SEEMS TO BE DISABLED.  WE SHOULD NEVER ARRIVE HERE.\n");
-            vTaskDelay(pdMS_TO_TICKS(100));
-            sw_unlock(E_SWLOCK_RTT);
-            continue;
-        }
-#endif
-
-        vTaskDelay(pdMS_TO_TICKS(100));            // give the target some time for startup
-        if ( !target_connect()) {
-            led_state(LS_NO_TARGET);
-
-            if (target_online) {
-                target_online = false;
-                picoprobe_info("=================================== Target lost\n");
+        if ( !dap_is_connected()) {
+            if (state_rtt_cb_detection == E_RTT_CB_FOUND  ||  state_rtt_cb_detection == E_RTT_CB_TARGET_LOST) {
+                state_rtt_cb_detection = E_RTT_CB_SEARCH;
             }
-            vTaskDelay(pdMS_TO_TICKS(900));
+            else if (state_rtt_cb_detection == E_RTT_CB_ACTIVE) {
+                state_rtt_cb_detection = E_RTT_CB_FOUND;
+            }
+            rtt_state_machine();
+            sw_unlock(E_SWLOCK_RTT);
+            vTaskDelay(pdMS_TO_TICKS(100));            // give the other tasks the opportunity to catch sw_lock();
         }
         else {
-            //
-            // search for RTT_CB
-            //
-            uint32_t prev_rtt_cb;
-
-            picoprobe_info("searching RTT_CB in 0x%08x..0x%08x, prev: 0x%08x\n",
-                           (unsigned)TARGET_RAM_START, (unsigned)(TARGET_RAM_END - 1), (unsigned)rtt_cb);
-            led_state(LS_TARGET_FOUND);
-            target_online = true;
-
-            prev_rtt_cb = rtt_cb;
-            if ( !search_for_rtt_cb( &rtt_cb, timeout_rtt_io_endless_tt))
-            {
-                // -> no RTT_CB in memory
-                if (rtt_cb_ok) {
-                    rtt_cb_ok = false;
-                    picoprobe_info("---- no RTT_CB found\n");
-                }
-                led_state(LS_TARGET_FOUND);
-                vTaskDelay(pdMS_TO_TICKS(900));
-            }
-            else
-            {
-                // RTT_CB found
-                if (rtt_cb != prev_rtt_cb) {
-                    rtt_cb_ok = true;
-                    picoprobe_info("---- RTT_CB found at 0x%x\n", (unsigned)rtt_cb);
-                }
-                led_state(LS_RTT_CB_FOUND);
-                do_rtt_io(rtt_cb, timeout_rtt_io_endless_tt);
-            }
-
-            target_disconnect();
+            rtt_while_debugging();
+            sw_unlock(E_SWLOCK_RTT);
         }
-        sw_unlock(E_SWLOCK_RTT);
-        vTaskDelay(pdMS_TO_TICKS(100));            // give the other task the opportunity to catch sw_lock();
     }
 }   // rtt_io_thread
 
@@ -1103,12 +990,7 @@ void rtt_console_init(uint32_t task_prio)
 #endif
 
     timer_rtt_io = xTimerCreate("RTT IO timeout", timeout_rtt_io_endless_tt,   pdFALSE, NULL, rtt_cb_timeout_null);
-
-#if NEW_RTT
     xTaskCreate(rtt_io_thread, "RTT-IO", configMINIMAL_STACK_SIZE, NULL, task_prio, &task_rtt_console);
-#else
-    xTaskCreate(rtt_io_thread_old, "RTT-IO", configMINIMAL_STACK_SIZE, NULL, task_prio, &task_rtt_console);
-#endif
 
     if (task_rtt_console == NULL)
     {
